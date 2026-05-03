@@ -49,23 +49,25 @@ def home():
         "status": "OK"
     })
 
-
-@app.route("/predict", methods=["POST"])
+@app.route("/api/health")
+def health():
+    return jsonify({"ok": True, "message": "API is healthy"})
+@app.route("/api/predict", methods=["POST"])
 def predict():
     try:
         # 🔴 Model check
         if model is None:
-            return jsonify({"error": "Model not loaded"}), 500
+            return jsonify({"ok": False, "error": "Model not loaded"}), 500
 
-        # 🔴 File check
-        if "file" not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
+        # 🔴 File check (FIXED)
+        if "image" not in request.files:
+            return jsonify({"ok": False, "error": "No file uploaded"}), 400
 
-        file = request.files["file"]
+        file = request.files["image"]
 
         # 🔴 Empty file check
         if file.filename == "":
-            return jsonify({"error": "Empty file"}), 400
+            return jsonify({"ok": False, "error": "Empty file"}), 400
 
         # ------------------ Read Image ------------------
         img = Image.open(io.BytesIO(file.read())).convert("RGB")
@@ -79,18 +81,17 @@ def predict():
         stage = get_stage(pred)
 
         # ------------------ Label Logic ------------------
-        if stage == "No Ulcer":
-            label = "Normal"
-        else:
-            label = "Ulcer"
+        label = "Normal" if stage == "No Ulcer" else "Ulcer"
 
         # ------------------ Confidence Threshold ------------------
         if confidence < 0.6:
             return jsonify({
-                "prediction": "Uncertain",
-                "confidence": round(confidence, 4),
-                "stage": "Unknown",
-                "message": "Model is not confident. Please upload a clearer image."
+                "ok": True,
+                "prediction": {
+                    "label": label,
+                    "confidence": round(confidence, 4),
+                    "stage": stage
+                }
             })
 
         # ------------------ Risk Level ------------------
@@ -102,8 +103,9 @@ def predict():
             else "Monitor regularly"
         )
 
-        # ------------------ Response ------------------
+        # ------------------ Final Response ------------------
         return jsonify({
+            "ok": True,   # 🔥 IMPORTANT (frontend needs this)
             "prediction": label,
             "stage": stage,
             "confidence": round(confidence, 4),
@@ -113,7 +115,7 @@ def predict():
 
     except Exception as e:
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ------------------ Run ------------------
