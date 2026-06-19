@@ -6,9 +6,10 @@ import numpy as np
 import io
 import traceback
 import os
+
 from utils import preprocess_image, get_stage, SpatialAttentionLayer
 
-# 🔥 Fix quantization_config issue
+# ------------------ Fix quantization_config issue ------------------
 from keras.layers import Dense
 
 original_init = Dense.__init__
@@ -19,26 +20,43 @@ def new_init(self, *args, **kwargs):
 
 Dense.__init__ = new_init
 
+
 # ------------------ Flask App ------------------
 app = Flask(__name__)
 CORS(app)
 
+# Reject uploads larger than 10 MB before the request body is read, so a very
+# large file can't exhaust server memory via file.read(). Flask raises 413
+# Request Entity Too Large automatically once this limit is exceeded.
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10 MB
+
+# Server-side allow-list of accepted image MIME types. The browser dropzone
+# already restricts to JPG/PNG, but any direct API client (curl, Postman)
+# bypasses that — so the same guard is enforced here.
+ALLOWED_TYPES = {"image/jpeg", "image/png"}
+
+
 # ------------------ Load Model ------------------
 MODEL_PATH = "final_model.keras"
 
-try:
-    model = tf.keras.models.load_model(
-        MODEL_PATH,
-        custom_objects={"SpatialAttentionLayer": SpatialAttentionLayer},
-        compile=False,
-        safe_mode=False
-    )
-    print("✅ Model Loaded Successfully")
+model = None
 
-except Exception as e:
-    print("❌ Model Loading Failed")
-    traceback.print_exc()
-    model = None
+def load_model():
+    global model
+    try:
+        model = tf.keras.models.load_model(
+            MODEL_PATH,
+            custom_objects={"SpatialAttentionLayer": SpatialAttentionLayer},
+            compile=False,
+            safe_mode=False
+        )
+        print("✅ Model Loaded Successfully")
+    except Exception:
+        print("❌ Model Loading Failed")
+        traceback.print_exc()
+
+load_model()
+
 
 # ------------------ Routes ------------------
 
@@ -49,52 +67,73 @@ def home():
         "status": "OK"
     })
 
+
 @app.route("/api/health")
 def health():
-    return jsonify({"ok": True, "message": "API is healthy"})
+    return jsonify({"ok": True})
+
+
 @app.route("/api/predict", methods=["POST"])
 def predict():
     try:
-        # 🔴 Model check
         if model is None:
             return jsonify({"ok": False, "error": "Model not loaded"}), 500
 
-        # 🔴 File check (FIXED)
         if "image" not in request.files:
             return jsonify({"ok": False, "error": "No file uploaded"}), 400
 
         file = request.files["image"]
 
-        # 🔴 Empty file check
         if file.filename == "":
             return jsonify({"ok": False, "error": "Empty file"}), 400
 
-        # ------------------ Read Image ------------------
-        img = Image.open(io.BytesIO(file.read())).convert("RGB")
+        # -------- Validate file type (server-side) --------
+        # A non-image upload is a client error (400), not a server error (500).
+        if file.content_type not in ALLOWED_TYPES:
+            return jsonify({
+                "ok": False,
+                "error": "Invalid file type. Only JPEG and PNG are accepted."
+            }), 400
 
-        # ------------------ Preprocess ------------------
+        # -------- Read Image --------
+        # Pillow raises UnidentifiedImageError on a file it can't decode (e.g. a
+        # renamed non-image). Catch it here and return 400 so it doesn't fall
+        # through to the generic 500 handler below.
+        try:
+            img = Image.open(io.BytesIO(file.read())).convert("RGB")
+        except Exception:
+            return jsonify({
+                "ok": False,
+                "error": "Could not read image. Please upload a valid JPEG or PNG."
+            }), 400
+
+        # -------- Preprocess --------
         input_img = preprocess_image(img)
 
-        # ------------------ Prediction ------------------
+        # -------- Predict --------
         pred = model.predict(input_img)
         confidence = float(np.max(pred))
         stage = get_stage(pred)
 
-        # ------------------ Label Logic ------------------
         label = "Normal" if stage == "No Ulcer" else "Ulcer"
 
-        # ------------------ Confidence Threshold ------------------
+        # -------- Confidence low case --------
+        # The frontend always reads risk_level and advice from the response, so
+        # both must be present here too — otherwise the result card renders an
+        # undefined risk and no advice for any low-confidence prediction. The
+        # values reflect the uncertainty; the note flag is retained.
         if confidence < 0.6:
             return jsonify({
                 "ok": True,
-                "prediction": {
-                    "label": label,
-                    "confidence": round(confidence, 4),
-                    "stage": stage
-                }
+                "prediction": label,
+                "stage": stage,
+                "confidence": round(confidence, 4),
+                "risk_level": "Unknown",
+                "advice": "Low confidence result — please consult a medical professional",
+                "note": "Low confidence prediction"
             })
 
-        # ------------------ Risk Level ------------------
+        # -------- Risk logic --------
         risk = "High" if stage in ["Moderate", "Severe"] else "Low"
 
         advice = (
@@ -103,9 +142,8 @@ def predict():
             else "Monitor regularly"
         )
 
-        # ------------------ Final Response ------------------
         return jsonify({
-            "ok": True,   # 🔥 IMPORTANT (frontend needs this)
+            "ok": True,
             "prediction": label,
             "stage": stage,
             "confidence": round(confidence, 4),
@@ -120,5 +158,5 @@ def predict():
 
 # ------------------ Run ------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 7860))   # 🔥 HF default port
     app.run(host="0.0.0.0", port=port)
